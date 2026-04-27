@@ -12,9 +12,9 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-use crate::fs::dcache::{DirEntry, OpState};
+use crate::fs::dcache::{DirEntry, DirtyFlags, Lifecycle, OpState};
 use crate::{err_fuse, FuseResult, FUSE_PATH_SEPARATOR, FUSE_ROOT_ID};
-use curvine_common::state::{FileStatus, LocatedBlock};
+use curvine_common::state::{FileStatus, LocatedBlock, SetAttrOpts};
 use orpc::common::LocalTime;
 use serde::{Deserialize, Serialize};
 use std::ops::{Deref, DerefMut};
@@ -28,12 +28,12 @@ pub struct Inode {
     pub status: FileStatus,
     pub locs: Option<Box<Vec<LocatedBlock>>>,
 
-    pub op_state: OpState,
+    pub lifecycle: Lifecycle,
+    pub dirty: DirtyFlags,
 
     pub n_lookup: u64,
     pub ref_ctr: u64,
     pub last_access: u64,
-    pub cache_valid: bool,
 
     pub dir: Option<Box<DirEntry>>,
 
@@ -55,11 +55,10 @@ impl Inode {
             name: FUSE_PATH_SEPARATOR.to_owned(),
             status: root_st,
             locs: None,
-            op_state: OpState::Cached,
+            lifecycle: Lifecycle::Cached,
             n_lookup: 0,
             ref_ctr: 0,
             last_access: LocalTime::mills(),
-            cache_valid: false,
             dir,
             ..Default::default()
         }
@@ -77,11 +76,10 @@ impl Inode {
             name: name.to_owned(),
             status,
             locs: None,
-            op_state: OpState::Cached,
+            lifecycle: Lifecycle::Cached,
             n_lookup: 1,
             ref_ctr: 1,
             last_access: LocalTime::mills(),
-            cache_valid: true,
             dir,
             ..Default::default()
         }
@@ -97,10 +95,15 @@ impl Inode {
             let _ = self.dir.take();
         }
 
-        self.op_state = OpState::Cached;
+        self.lifecycle = Lifecycle::Cached;
         self.status = status;
-        self.cache_valid = true;
         self.last_access = LocalTime::mills();
+    }
+
+    pub fn invalid_cache(&mut self) {
+        if matches!(self.lifecycle, Lifecycle::Cached) {
+            self.lifecycle = Lifecycle::Invalid;
+        }
     }
 
     pub fn is_root(&self) -> bool {
@@ -109,6 +112,7 @@ impl Inode {
 
     pub fn add_lookup(&mut self, v: u64) -> u64 {
         self.n_lookup = self.n_lookup.saturating_add(v);
+        self.last_access = LocalTime::mills();
         self.n_lookup
     }
 
@@ -154,6 +158,87 @@ impl Inode {
             );
         }
         Ok(())
+    }
+
+    pub fn ensure_file(&self) -> FuseResult<()> {
+        if self.is_dir {
+            err_fuse!(libc::EIO, "inode {} is not a file", self.ino)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        matches!(self.lifecycle, Lifecycle::Dirty)
+    }
+
+    pub fn is_data_dirty(&self) -> bool {
+        self.dirty.intersects(DirtyFlags::DATA | DirtyFlags::SIZE)
+    }
+
+    pub fn is_attr_dirty(&self) -> bool {
+        self.dirty.contains(DirtyFlags::ATTR)
+    }
+
+    pub fn is_staging(&self) -> bool {
+        self.dirty.contains(DirtyFlags::NEW)
+    }
+
+    pub fn cache_valid(&self, ttl: u64) -> bool {
+        match self.lifecycle {
+            Lifecycle::Cached => self.last_access + ttl >= LocalTime::mills(),
+            Lifecycle::Dirty => true,
+            Lifecycle::Invalid => false,
+        }
+    }
+
+    pub fn mark_create(&mut self) {
+        self.lifecycle = Lifecycle::Dirty;
+        self.dirty.insert(DirtyFlags::NEW);
+    }
+
+    pub fn dirty_write(&mut self, len: i64) -> FuseResult<()> {
+        self.ensure_file()?;
+        self.len = len;
+        Ok(())
+    }
+
+    pub fn dirty_flush(&mut self) -> FuseResult<()> {
+        self.ensure_file()?;
+        self.mtime = LocalTime::mills() as i64;
+        Ok(())
+    }
+
+    pub fn dirty_set_attr(&mut self, opts: SetAttrOpts) -> FuseResult<FileStatus> {
+        if self.is_dirty() {
+            return err_fuse!(libc::EIO, "inode {} is dirty", self.ino);
+        }
+        self.dirty.insert(DirtyFlags::ATTR);
+
+        if let Some(mtime)  = opts.mtime {
+            self.mtime = mtime;
+        }
+
+        if let Some(atime)  = opts.atime {
+            self.atime = atime;
+        }
+
+        if let Some(mode) = opts.mode {
+            self.mode = mode;
+        }
+
+        if let Some(owner) = opts.owner {
+            self.owner = owner;
+        }
+
+        if let Some(group) = opts.group {
+            self.group = group;
+        }
+
+        self.x_attr.extend(opts.add_x_attr);
+        self.x_attr.retain(|k, _| !opts.remove_x_attr.contains(k));
+
+        Ok(self.status.clone())
     }
 }
 

@@ -12,13 +12,23 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
+use bitflags::bitflags;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
-#[repr(i8)]
-pub enum OpState {
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Lifecycle {
     #[default]
     Cached,
-    Creating,
-    DirtyAttr,
+    Invalid,
+    Dirty,
+}
+
+
+bitflags! {
+  #[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+  pub struct DirtyFlags: u32 {
+      const NEW       = 1 << 0;
+      const DATA      = 1 << 1;
+      const ATTR      = 1 << 2;
+  }
 }

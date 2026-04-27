@@ -26,3 +26,9 @@ pub use self::file_handle::FileHandle;
 
 mod dir_handle;
 pub use self::dir_handle::DirHandle;
+
+mod cache_handle;
+pub use self::cache_handle::CacheHandle;
+
+mod backend_handle;
+pub use self::backend_handle::BackendHandle;

@@ -12,18 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::fs::dcache::DirTree;
+use std::fs::File;
+use crate::fs::dcache::{DirTree, Inode};
 use crate::fs::state::file_handle::FileHandle;
 use crate::fs::state::DirHandle;
 use crate::fs::{CurvineFileSystem, FuseReader, FuseWriter};
 use crate::raw::fuse_abi::{fuse_attr, fuse_forget_one};
-use crate::{
-    err_fuse, FuseResult, FUSE_CURRENT_DIR, FUSE_PARENT_DIR, STATE_FILE_MAGIC, STATE_FILE_VERSION,
-};
+use crate::{err_fuse, FuseResult, FUSE_CURRENT_DIR, FUSE_PARENT_DIR, STATE_FILE_MAGIC, STATE_FILE_VERSION, FuseError, FuseUtils};
 use curvine_client::unified::UnifiedFileSystem;
 use curvine_common::conf::{ClientConf, ClusterConf, FuseConf};
 use curvine_common::fs::{FileSystem, ListStream, Path, StateReader, StateWriter};
-use curvine_common::state::{CreateFileOpts, FileStatus, ListOptions, OpenFlags};
+use curvine_common::state::{CreateFileOpts, CreateFileOptsBuilder, FileStatus, FileType, ListOptions, MkdirOpts, OpenFlags, SetAttrOpts};
 use futures::stream::{self, StreamExt};
 use log::{error, info, warn};
 use orpc::common::{FastHashMap, LocalTime};
@@ -31,6 +30,11 @@ use orpc::err_box;
 use orpc::sync::{AtomicCounter, RwLockHashMap};
 use orpc::sys::RawPtr;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use libc::stat;
+use tokio::sync::TryAcquireError::NoPermits;
+use curvine_common::FsResult;
+use crate::fs::operator::{Create, Open};
+use crate::fs::pcache::CacheManager;
 
 pub struct NodeState {
     dir_tree: RwLock<DirTree>,
@@ -40,14 +44,21 @@ pub struct NodeState {
     fs: UnifiedFileSystem,
     conf: FuseConf,
     enable_meta_cache: bool,
+    enable_write_back: bool,
     meta_cache_ttl: u64,
+    cache: Arc<CacheManager>,
 }
 
 impl NodeState {
     pub fn new(fs: UnifiedFileSystem) -> Self {
         let conf = fs.conf().fuse.clone();
-        let enable_meta_cache = conf.enable_meta_cache;
+        let enable_write_back = conf.enable_write_back;
         let meta_cache_ttl = conf.meta_cache_ttl.as_millis() as u64;
+        let enable_meta_cache = if enable_write_back {
+            true
+        } else {
+            conf.enable_meta_cache
+        };
 
         Self {
             dir_tree: RwLock::new(DirTree::new(conf.clone())),
@@ -57,7 +68,9 @@ impl NodeState {
             fs,
             conf,
             enable_meta_cache,
+            enable_write_back,
             meta_cache_ttl,
+            cache: Arc::new(CacheManager::new()),
         }
     }
 
@@ -78,23 +91,11 @@ impl NodeState {
     }
 
     pub fn invalid_cache(&self, ino: u64, name: Option<&str>) {
-        let mut dir = self.dir_write();
-        if let Some(inode) = dir.get_inode_mut(ino, name) {
-            inode.cache_valid = false;
-        };
-    }
-
-    pub fn get_cache_status(&self, ino: u64, name: Option<&str>) -> Option<FileStatus> {
-        if !self.enable_meta_cache {
-            return None;
-        }
-        let dir = self.dir_read();
-        let inode = dir.get_inode(ino, name)?;
-
-        if inode.cache_valid && inode.last_access + self.meta_cache_ttl >= LocalTime::mills() {
-            Some(inode.status.clone())
-        } else {
-            None
+        if self.enable_meta_cache {
+            let mut dir = self.dir_write();
+            if let Some(inode) = dir.get_inode_mut(ino, name) {
+                inode.invalid_cache();
+            };
         }
     }
 
@@ -110,21 +111,25 @@ impl NodeState {
     ///   - First access OR unchanged mtime/len → cache is valid
     ///   - We don't use kernel notification (FUSE_NOTIFY_INVAL_INODE) as it causes deadlocks in practice
     ///
-    pub fn update_status(&self, ino: u64, status: FileStatus) -> (bool, bool) {
+    pub fn update_status(&self, ino: u64, status: &FileStatus) -> (bool, bool) {
         let mut lock = self.dir_write();
         let inode = match lock.get_inode_mut(ino, None) {
             Some(inode) => inode,
             None => return (false, false),
         };
 
-        let is_changed = inode.mtime != status.mtime || status.len != inode.len;
-        let cache_valid = inode.cache_valid;
-        inode.update_status(status);
+        if inode.is_dirty() {
+            (true, true)
+        } else {
+            let is_changed = inode.mtime != status.mtime || status.len != inode.len;
+            let cache_valid = inode.cache_valid(self.meta_cache_ttl);
+            inode.update_status(status.clone());
 
-        (cache_valid, is_changed)
+            (cache_valid, is_changed)
+        }
     }
 
-    pub fn keep_cache(&self, ino: u64, status: FileStatus) -> bool {
+    pub fn keep_cache(&self, ino: u64, status: &FileStatus) -> bool {
         let (cache_valid, is_changed) = self.update_status(ino, status);
         !cache_valid || !is_changed
     }
@@ -176,14 +181,24 @@ impl NodeState {
         self.dir_read().next_id(status.id)
     }
 
-    pub fn lookup(&self, parent: u64, name: &str, status: FileStatus) -> FuseResult<fuse_attr> {
+    pub fn lookup_status(&self, parent: u64, name: &str, status: FileStatus) -> FuseResult<fuse_attr> {
         let mut dir = self.dir_write();
 
         dir.clear(|ino| self.has_open_handles(ino));
 
         let inode = dir.lookup(parent, name, status)?;
-        CurvineFileSystem::status_to_attr(&self.conf, inode)
+        CurvineFileSystem::status_to_attr(&self.conf, &inode.status)
     }
+
+    pub fn lookup_handle(&self, parent: u64, name: &str, handle: &FileHandle) -> FuseResult<fuse_attr> {
+        let mut dir = self.dir_write();
+        let inode = dir.lookup(parent, name, handle.status().clone())?;
+        if matches!(handle, FileHandle::Cache(_)) {
+            inode.mark_create();
+        }
+        CurvineFileSystem::status_to_attr(&self.conf, &inode.status)
+    }
+
 
     pub fn get_ino(&self, parent: u64, name: Option<&str>) -> Option<u64> {
         if name.is_none() {
@@ -228,15 +243,12 @@ impl NodeState {
         map: &FastHashMap<u64, FastHashMap<u64, Arc<FileHandle>>>,
         ino: u64,
     ) -> Option<Arc<FuseWriter>> {
-        if let Some(h) = map.get(&ino) {
-            for (_, handle) in h.iter() {
-                if let Some(writer) = &handle.writer {
-                    return Some(writer.clone());
-                }
-            }
-        }
-
-        None
+        map.get(&ino)?
+            .values()
+            .find_map(|handle| match handle.as_ref() {
+                FileHandle::Backend(h) => h.writer.clone(),
+                FileHandle::Cache(_) => None,
+        })
     }
 
     pub fn find_writer(&self, ino: u64) -> Option<Arc<FuseWriter>> {
@@ -266,6 +278,59 @@ impl NodeState {
             existing_writer.flush(None).await?;
         }
         Ok(())
+    }
+
+    pub fn new_cache_handle(&self, ino: u64, status: FileStatus, flags: u32) -> FuseResult<Arc<FileHandle>> {
+        let handle = FileHandle::new_cache(
+            ino,
+            self.next_fh(),
+            self.cache.clone(),
+            status,
+            flags,
+        );
+        let handle = Arc::new(handle);
+        self.handles.write()
+            .entry(handle.ino())
+            .or_default()
+            .insert(handle.fh(), handle.clone());
+
+        Ok(handle)
+    }
+
+    pub async fn create(
+        &self,
+        ino: u64,
+        name: &str,
+        flags: u32,
+        opts: CreateFileOpts,
+    ) -> FuseResult<Arc<FileHandle>> {
+        let path = self.get_path_name(ino, name)?;
+        if self.enable_write_back {
+            let status = FuseUtils::file_opts_to_status(&path, opts);
+            self.new_cache_handle(ino, status, flags)
+        } else {
+            self.new_handle(None, &path, flags, opts).await
+        }
+    }
+
+    pub async fn open(
+        &self,
+        ino: u64,
+        flags: u32,
+        opts: CreateFileOpts,
+    ) -> FuseResult<Arc<FileHandle>> {
+        let path = {
+            let dir = self.dir_read();
+            let inode = dir.get_inode_check(ino, None)?;
+
+            if inode.is_dirty() {
+                return self.new_cache_handle(ino, inode.status.clone(), flags)
+            }
+
+            dir.get_path(ino)?
+        };
+
+        self.new_handle(Some(ino), &path, flags, opts).await
     }
 
     pub async fn new_handle(
@@ -342,7 +407,7 @@ impl NodeState {
             None
         };
 
-        let handle = Arc::new(FileHandle::new(
+        let handle = Arc::new(FileHandle::new_backend(
             ino,
             self.next_fh(),
             reader,
@@ -350,9 +415,9 @@ impl NodeState {
             status,
         ));
 
-        lock.entry(handle.ino)
+        lock.entry(handle.ino())
             .or_default()
-            .insert(handle.fh, handle.clone());
+            .insert(handle.fh(), handle.clone());
 
         Ok(handle)
     }
@@ -530,6 +595,85 @@ impl NodeState {
         Ok(ListStream::new(dots.chain(inner)))
     }
 
+    pub fn check_tree(&self) -> bool {
+        self.enable_meta_cache || self.enable_write_back
+    }
+
+    pub async fn fs_stat(
+        &self,
+        ino: u64,
+        name: Option<&str>,
+    ) -> FuseResult<FileStatus> {
+        let path = {
+            let dir = self.dir_read();
+
+            if self.enable_meta_cache {
+                let inode = dir.get_inode(ino, name)
+                    .filter(|inode| inode.cache_valid(self.meta_cache_ttl));
+
+                if let Some(inode) = inode {
+                    return Ok(inode.status.clone());
+                }
+            }
+
+            dir.get_path_common(ino, name)?
+        };
+
+        let status = self.fs.get_status(&path).await?;
+        Ok(status)
+    }
+
+    ///
+    /// fuse lookup 请求调用改方法
+    /// 1. 如果inode缓存有效或者为dirty，增加lookup，返回缓存的status
+    /// 2. 否则调用fs.get_status，并且更新inode status信息
+    pub async fn fs_lookup(&self, ino: u64, name: &str) -> FuseResult<fuse_attr> {
+        let path = {
+            let mut dir = self.dir_write();
+            dir.clear(|ino| self.has_open_handles(ino));
+
+            if self.enable_meta_cache {
+                let inode = dir
+                    .get_inode_mut(ino, Some(name))
+                    .filter(|inode| inode.cache_valid(self.meta_cache_ttl));
+
+                if let Some(inode) = inode {
+                    inode.add_lookup(1);
+                    let attr = CurvineFileSystem::status_to_attr(&self.conf, &inode.status)?;
+                    return Ok(attr);
+                }
+            }
+
+            dir.get_path_name(ino, name)?
+        };
+
+        let status = self.fs.get_status(&path).await?;
+        self.lookup_status(ino, name, status)
+    }
+
+    /// 设置文件属性
+    /// 只有通过本客服端创建 dirty 文件，才会设置本地属性
+    /// 其他状态的问题件，直接通过远端文件系统设置
+    pub async fn fs_set_attr(&self, ino: u64, opts: SetAttrOpts) -> FuseResult<Option<FileStatus>> {
+        let path =  {
+            let mut dir =  self.dir_write();
+
+            if self.enable_meta_cache {
+                let inode = dir.get_inode_mut_check(ino, None)?;
+                if inode.is_dirty() {
+                    inode.dirty_set_attr(opts)?;
+                    return Ok(Some(inode.status.clone()));
+                }
+            }
+
+            dir.get_path(ino)?
+        };
+
+        let status = self.fs.fuse_set_attr(&path, opts).await?;
+        self.invalid_cache(ino, None);
+        Ok(status)
+    }
+
     pub async fn restore(&self, reader: &mut StateReader) -> FuseResult<()> {
         let mut magic = [0u8; 4];
         reader.read_exact(&mut magic)?;
@@ -576,9 +720,9 @@ impl NodeState {
 
             self.handles
                 .write()
-                .entry(handle.ino)
+                .entry(handle.ino())
                 .or_default()
-                .insert(handle.fh, Arc::new(handle));
+                .insert(handle.fh(), Arc::new(handle));
             restored_handles += 1;
         }
         info!(

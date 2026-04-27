@@ -12,14 +12,8 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-mod inode;
-pub use self::inode::Inode;
+mod inode_cache;
+pub use self::inode_cache::*;
 
-mod op_state;
-pub use self::op_state::*;
-
-mod dir_entry;
-pub use self::dir_entry::DirEntry;
-
-mod dir_tree;
-pub use self::dir_tree::DirTree;
+mod cache_manager;
+pub use self::cache_manager::CacheManager;

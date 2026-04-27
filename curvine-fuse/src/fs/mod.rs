@@ -32,3 +32,10 @@ mod fuse_writer;
 pub use self::fuse_writer::FuseWriter;
 
 pub mod dcache;
+
+
+pub mod pcache;
+
+// pub mod pcache2;
+// mod write_back_cache;
+// pub use self::write_back_cache::{WriteBackCache, WriteBackConf, DEFAULT_WB_MEM_LIMIT};

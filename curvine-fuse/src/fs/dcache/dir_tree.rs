@@ -12,14 +12,15 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
+use futures::future::ok;
 use crate::fs::dcache::inode::Inode;
-use crate::fs::dcache::DirEntry;
+use crate::fs::dcache::{DirEntry, OpState};
 use crate::{
     err_fuse, FuseResult, FUSE_PATH_MAX_DEPTH, FUSE_PATH_SEPARATOR, FUSE_ROOT_ID, FUSE_UNKNOWN_INO,
 };
 use curvine_common::conf::FuseConf;
 use curvine_common::fs::{Path, StateReader, StateWriter};
-use curvine_common::state::FileStatus;
+use curvine_common::state::{CreateFileOpts, FileStatus, SetAttrOpts};
 use log::info;
 use orpc::common::{FastHashMap, LocalTime};
 use orpc::sync::AtomicCounter;
@@ -134,7 +135,7 @@ impl DirTree {
     }
 
     // LOOKUP: create inode and parent directory entry as needed.
-    pub fn lookup(&mut self, parent: u64, name: &str, status: FileStatus) -> FuseResult<&Inode> {
+    pub fn lookup(&mut self, parent: u64, name: &str, status: FileStatus) -> FuseResult<&mut Inode> {
         let ino = match self.get_inode_mut(parent, Some(name)) {
             Some(inode) => {
                 inode.add_lookup(1);
@@ -153,7 +154,7 @@ impl DirTree {
         let dir = self.get_dir_mut_check(parent)?;
         dir.children.insert(name.to_owned(), ino);
 
-        self.get_inode_check(ino, None)
+        self.get_inode_mut_check(ino, None)
     }
 
     pub fn unlink(&mut self, parent: u64, name: &str) -> FuseResult<()> {
@@ -340,6 +341,7 @@ impl DirTree {
             .values()
             .filter(|inode| {
                 !inode.is_root()
+                    && !inode.has_cache_data()
                     && !has_open_handles(inode.ino)
                     && inode.last_access + self.cache_ttl <= now
                     && inode.dir.as_ref().is_none_or(|d| d.children.is_empty())
@@ -369,6 +371,10 @@ impl DirTree {
     #[cfg(test)]
     pub(crate) fn set_last_clean_for_test(&mut self, last_clean: u64) {
         self.last_clean = last_clean;
+    }
+
+    pub fn create_file(&mut self, ino: u64, name: &str, opts: CreateFileOpts) {
+        let status =
     }
 }
 

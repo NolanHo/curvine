@@ -12,50 +12,58 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::fs::operator::{Read, Write};
-use crate::fs::state::NodeState;
-use crate::fs::{FuseReader, FuseWriter};
-use crate::session::FuseResponse;
-use crate::{err_fuse, FuseError, FuseResult};
-use curvine_common::fs::{Path, StateReader, StateWriter};
-use curvine_common::state::{CreateFileOptsBuilder, FileStatus, LockFlags, OpenFlags};
-use orpc::err_box;
-use orpc::sys::RawPtr;
-use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use curvine_common::fs::{StateReader, StateWriter};
+use curvine_common::state::{FileStatus, LockFlags};
+use orpc::sys::RawPtr;
+use crate::fs::{FuseReader, FuseWriter};
+use crate::fs::operator::{Read, Write};
+use crate::fs::pcache::CacheManager;
+use crate::fs::state::{BackendHandle, CacheHandle, NodeState};
+use crate::fs::state::FileHandle::{Backend, Cache};
+use crate::FuseResult;
+use crate::session::FuseResponse;
 
-#[derive(Debug, Default, Serialize, Deserialize)]
-struct HandleLock {
-    flock_owner_id: Option<u64>,
-    plock_owner_id: Option<u64>,
-}
-
-pub struct FileHandle {
-    pub ino: u64,
-    pub fh: u64,
-
-    pub reader: Option<RawPtr<FuseReader>>,
-    pub writer: Option<Arc<FuseWriter>>, // Writer uses Arc for global sharing
-    pub status: FileStatus,
-
-    fh_locks: std::sync::Mutex<HandleLock>,
+pub enum FileHandle {
+    Cache(CacheHandle),
+    Backend(BackendHandle)
 }
 
 impl FileHandle {
-    pub fn new(
+    pub fn new_cache(ino: u64, fh: u64, cache: Arc<CacheManager>, status: FileStatus, flags: u32) -> Self {
+        let handle = CacheHandle::new(ino, fh, cache, status, flags);
+        Cache(handle)
+    }
+
+    pub fn new_backend(
         ino: u64,
         fh: u64,
         reader: Option<RawPtr<FuseReader>>,
         writer: Option<Arc<FuseWriter>>,
         status: FileStatus,
     ) -> Self {
-        Self {
-            ino,
-            fh,
-            reader,
-            writer,
-            status,
-            fh_locks: std::sync::Mutex::new(HandleLock::default()),
+        let handle = BackendHandle::new(ino, fh, reader, writer, status);
+        Backend(handle)
+    }
+
+    pub fn has_writer(&self) -> bool {
+        match self {
+            Cache(h) => h.flags.write(),
+            Backend(h) => h.writer.is_some()
+        }
+    }
+
+    pub fn ino(&self) -> u64 {
+        match self {
+            Cache(h) => h.ino,
+            Backend(h) => h.ino
+        }
+    }
+
+    pub fn fh(&self) -> u64 {
+        match self {
+            Cache(h) => h.fh,
+            Backend(h) => h.fh
         }
     }
 
@@ -65,151 +73,62 @@ impl FileHandle {
         op: Read<'_>,
         reply: FuseResponse,
     ) -> FuseResult<()> {
-        let reader = match &self.reader {
-            Some(v) => v,
-            None => return err_fuse!(libc::EIO),
-        };
-
-        if op.arg.offset as i64 > reader.len() {
-            if let Some(writer) = state.find_writer(self.ino) {
-                writer.flush(None).await?;
-
-                // TODO: Optimize by adding refresh interface to refresh block list
-                let path = reader.path().clone();
-                reader.complete(None).await?;
-                let new_reader = state.new_reader(&path).await?;
-                reader.replace(new_reader);
-            }
+        match self {
+            Cache(h) => h.read(state, op, reply).await,
+            Backend(h) => h.read(state, op, reply).await
         }
-
-        reader.read(op, reply).await?;
-        Ok(())
     }
 
-    pub async fn write(&self, op: Write<'_>, reply: FuseResponse) -> FuseResult<()> {
-        if op.data.is_empty() {
-            return Ok(());
-        }
-
-        if let Some(writer) = &self.writer {
-            writer.write(op, reply).await?;
-            Ok(())
-        } else {
-            err_fuse!(libc::EIO)
+    pub async fn write(&self, op: Write<'_>, state: &NodeState, reply: FuseResponse) -> FuseResult<()> {
+        match self {
+            Cache(h) => h.write(state, op, reply).await,
+            Backend(h) => h.write(op, reply).await
         }
     }
 
     pub async fn flush(&self, reply: Option<FuseResponse>) -> FuseResult<()> {
-        if let Some(writer) = &self.writer {
-            writer.flush(reply).await?;
-        } else if let Some(reply) = reply {
-            reply.send_rep(Ok::<(), FuseError>(())).await?;
+        match self {
+            Cache(h) => h.flush(reply).await,
+            Backend(h) => h.flush(reply).await
         }
-        Ok(())
     }
 
-    pub async fn complete(&self, mut reply: Option<FuseResponse>) -> FuseResult<()> {
-        if let Some(writer) = &self.writer {
-            if Arc::strong_count(writer) <= 1 {
-                writer.complete(reply.take()).await?;
-            } else {
-                writer.flush(reply.take()).await?;
-            }
+    pub async fn complete(&self, reply: Option<FuseResponse>) -> FuseResult<()> {
+        match self {
+            Cache(h) => h.complete(reply).await,
+            Backend(h) => h.complete(reply).await
         }
-        if let Some(reader) = &self.reader {
-            reader.complete(reply.take()).await?;
-        }
-        Ok(())
     }
 
     pub fn status(&self) -> &FileStatus {
-        &self.status
-    }
-
-    // Add lock, only save the owner_id of the first lock
-    pub fn add_lock(&self, lock_flags: LockFlags, owner_id: u64) {
-        let mut fh_locks = self.fh_locks.lock().unwrap();
-
-        match lock_flags {
-            LockFlags::Plock => {
-                fh_locks.plock_owner_id.get_or_insert(owner_id);
-            }
-
-            LockFlags::Flock => {
-                fh_locks.flock_owner_id.get_or_insert(owner_id);
-            }
+        match self {
+            Cache(h) => h.status(),
+            Backend(h) => h.status()
         }
     }
 
-    // Remove lock, return owner_id
+    pub fn add_lock(&self, lock_flags: LockFlags, owner_id: u64) {
+        match self {
+            Cache(h) => h.add_lock(lock_flags, owner_id),
+            Backend(h) => h.add_lock(lock_flags, owner_id)
+        }
+    }
+
     pub fn remove_lock(&self, typ: LockFlags) -> Option<u64> {
-        let mut fh_locks = self.fh_locks.lock().unwrap();
-
-        match typ {
-            LockFlags::Plock => fh_locks.plock_owner_id.take(),
-
-            LockFlags::Flock => fh_locks.flock_owner_id.take(),
+        match self {
+            Cache(h) => h.remove_lock(typ),
+            Backend(h) => h.remove_lock(typ)
         }
     }
 
     pub async fn persist(&self, writer: &mut StateWriter) -> FuseResult<()> {
-        self.complete(None).await?;
-
-        writer.write_len(self.ino)?;
-        writer.write_len(self.fh)?;
-        writer.write_struct(&self.status)?;
-
-        writer.write_struct(&self.writer.is_some())?;
-        writer.write_struct(&self.reader.is_some())?;
-
-        let locks = self.fh_locks.lock().unwrap();
-        writer.write_struct(&*locks)?;
-
-        Ok(())
+        match self {
+            Cache(h) =>h.persist(writer).await,
+            Backend(h) => h.persist(writer).await
+        }
     }
 
     pub async fn restore(reader: &mut StateReader, state: &NodeState) -> FuseResult<Self> {
-        let ino = reader.read_len()?;
-        let fh = reader.read_len()?;
-        let status: FileStatus = reader.read_struct()?;
-
-        let has_writer: bool = reader.read_struct()?;
-        let has_reader: bool = reader.read_struct()?;
-        if !has_writer && !has_reader {
-            return err_box!(
-                "FileHandle has neither reader nor writer for ino={}, path={}",
-                ino,
-                status.path
-            );
-        }
-        let locks: HandleLock = reader.read_struct()?;
-
-        let path = Path::from_str(&status.path)?;
-        let writer = if has_writer {
-            let opts = CreateFileOptsBuilder::with_conf(state.client_conf()).build();
-            let writer = state
-                .new_writer(&path, OpenFlags::new_write_only(), opts)
-                .await?;
-            Some(writer)
-        } else {
-            None
-        };
-
-        let reader = if has_reader {
-            let reader = state.new_reader(&path).await?;
-            Some(RawPtr::from_owned(reader))
-        } else {
-            None
-        };
-
-        let handle = Self {
-            ino,
-            fh,
-            reader,
-            writer,
-            status,
-            fh_locks: std::sync::Mutex::new(locks),
-        };
-        Ok(handle)
+        todo!()
     }
 }

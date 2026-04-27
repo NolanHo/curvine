@@ -15,13 +15,18 @@
 #![allow(unused_variables)]
 
 use crate::*;
-use curvine_common::state::{FileStatus, FileType};
+use curvine_common::state::{CreateFileOpts, CreateFileOptsBuilder, FileStatus, FileType, MkdirOpts, MkdirOptsBuilder};
 use orpc::io::IOResult;
 use orpc::sys;
 use orpc::sys::{FFIUtils, RawIO};
 use std::process::Command;
 use std::slice;
 use tokio_util::bytes::BytesMut;
+use curvine_client::unified::UnifiedFileSystem;
+use curvine_common::fs::Path;
+use orpc::common::LocalTime;
+use crate::fs::operator::{Create, MkDir};
+use crate::raw::fuse_abi::fuse_create_in;
 
 pub struct FuseUtils;
 
@@ -157,6 +162,58 @@ impl FuseUtils {
             FileType::Link => status.target.as_ref().map(|x| x.len()).unwrap_or(0) as u64,
             FileType::Dir => FUSE_DEFAULT_PAGE_SIZE as u64,
             _ => status.len as u64,
+        }
+    }
+
+    pub fn is_dot(&self, name: &str) -> bool {
+        name == FUSE_PARENT_DIR || name == FUSE_CURRENT_DIR
+    }
+
+    pub fn create_opts(op: &Create<'_>, fs: &UnifiedFileSystem) -> CreateFileOpts {
+        let mut builder = CreateFileOptsBuilder::with_conf(&fs.conf().client);
+        if op.arg.mode != 0 {
+            builder = builder.acl(
+                op.header.uid,
+                op.header.gid,
+                op.arg.mode & 0o7777 & !op.arg.umask,
+            )
+        }
+
+        builder.build()
+    }
+
+    pub fn open_opts(fs: &UnifiedFileSystem) -> CreateFileOpts {
+        CreateFileOptsBuilder::with_conf(&fs.conf().client)
+            .build()
+    }
+
+    pub fn mkdir_opts(op: &MkDir<'_>, fs: &UnifiedFileSystem) -> MkdirOpts {
+        let mut builder = MkdirOptsBuilder::with_conf(&fs.conf().client);
+        if op.arg.mode != 0 {
+            builder = builder.acl(
+                op.header.uid,
+                op.header.gid,
+                op.arg.mode & 0o7777 & !op.arg.umask,
+            )
+        }
+
+        builder.build()
+    }
+
+
+    pub fn file_opts_to_status(path: &Path, opts: CreateFileOpts) -> FileStatus {
+        let time = LocalTime::mills() as i64;
+        FileStatus {
+            path: path.clone_uri(),
+            name: path.name().to_owned(),
+            is_dir: false,
+            file_type: FileType::File,
+            atime: time,
+            mtime: time,
+            mode: opts.mode,
+            owner: opts.owner,
+            group: opts.group,
+            ..Default::default()
         }
     }
 }

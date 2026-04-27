@@ -111,6 +111,8 @@ pub struct FuseConf {
 
     pub congestion_threshold: u16,
 
+    pub enable_write_back: bool,
+
     // Whether to enable metadata cache
     pub enable_meta_cache: bool,
 
@@ -298,6 +300,7 @@ impl Default for FuseConf {
             max_background: 256,
             congestion_threshold: 192,
 
+            enable_write_back: true,
             enable_meta_cache: false,
             meta_cache_timeout: "120s".to_string(),
             node_cache_timeout: "1h".to_string(),
